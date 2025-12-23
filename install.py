@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 def link_dir(src_dir: Path, dst_dir: Path) -> None:
+    if dst_dir.exists() and not dst_dir.is_dir():
+        dst_dir.unlink()
     dst_dir.mkdir(parents=True, exist_ok=True)
     for file in src_dir.glob("*.sh"):
         target = dst_dir / file.name
