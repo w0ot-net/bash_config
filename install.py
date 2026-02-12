@@ -32,7 +32,7 @@ def main() -> None:
     link_dir(repo_dir / "aliases", aliases_dir)
     link_dir(repo_dir / "functions", functions_dir)
 
-    bashrc_marker = "# bash_config loader"
+    bashrc_marker = "# bash_config loader v2"
     bashrc_snippet = f"""
 {bashrc_marker}
 if [ -d "$HOME/.bash_aliases" ]; then
@@ -46,6 +46,11 @@ if [ -d "$HOME/.bash_functions" ]; then
     for file in "$HOME/.bash_functions"/*.sh; do
         [ -e "$file" ] || continue
         . "$file"
+    done
+    # Export functions so bash subshells (watch, xargs, bash -c) see them.
+    for file in "$HOME/.bash_functions"/*.sh; do
+        [ -e "$file" ] || continue
+        export -f "$(basename "${{file%.sh}}")" 2>/dev/null
     done
 fi
 """
