@@ -2,6 +2,7 @@
 _DEFAULT_IFACE_DIR="${TMPDIR%/}/default-iface-state"
 _DEFAULT_IFACE_TABLE=42
 _DEFAULT_IFACE_PRIO=100
+_DEFAULT_IFACE_REPLY_PRIO=50
 
 mkdir -p "$_DEFAULT_IFACE_DIR"
 
@@ -17,6 +18,7 @@ _default_iface_rebuild() {
     )
 
     ip route flush table "$_DEFAULT_IFACE_TABLE" 2>/dev/null
+    while ip rule del priority "$_DEFAULT_IFACE_REPLY_PRIO" 2>/dev/null; do :; done
 
     if [ -z "$blocked" ]; then
         ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
@@ -40,6 +42,14 @@ _default_iface_rebuild() {
 
     ip rule del priority 32766 2>/dev/null
     ip rule add priority 32766 lookup main suppress_prefixlength 0
+
+    # Source-based rules: reply traffic from blocked interface IPs still routes normally
+    local addr
+    for iface in $blocked; do
+        for addr in $(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}'); do
+            ip rule add from "${addr%/*}" lookup main priority "$_DEFAULT_IFACE_REPLY_PRIO"
+        done
+    done
 }
 
 default_iface_block() {
