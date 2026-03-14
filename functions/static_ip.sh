@@ -39,6 +39,11 @@ set_static_ip() {
         gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/via/{print $3; exit}')
     fi
 
+    # Stop NetworkManager from managing this interface
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device set "$iface" managed no 2>/dev/null
+    fi
+
     # Release DHCP lease and stop dhclient
     command dhclient -r "$iface" 2>/dev/null
 
@@ -66,6 +71,11 @@ set_dynamic_ip() {
 
     # Remove state (unblocks dhclient via the hook's file check)
     rm -f "$_STATIC_IP_STATE/$iface.static"
+
+    # Re-enable NetworkManager management
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device set "$iface" managed yes 2>/dev/null
+    fi
 
     # Flush and acquire via DHCP
     ip addr flush dev "$iface"
