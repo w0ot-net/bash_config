@@ -8,6 +8,10 @@ def link_dir(src_dir: Path, dst_dir: Path) -> None:
     if dst_dir.exists() and not dst_dir.is_dir():
         dst_dir.unlink()
     dst_dir.mkdir(parents=True, exist_ok=True)
+    src_names = {f.name for f in src_dir.glob("*.sh")}
+    for target in dst_dir.glob("*.sh"):
+        if target.is_symlink() and target.name not in src_names:
+            target.unlink()
     for file in src_dir.glob("*.sh"):
         target = dst_dir / file.name
         if target.is_symlink() or target.exists():
