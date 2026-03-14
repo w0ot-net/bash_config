@@ -16,8 +16,9 @@ def collect_managed_names(repo_dir: Path) -> set[str]:
     return names
 
 
-def clean_bashrc(rc_file: Path, managed_names: set[str]) -> None:
-    """Remove stale alias/function definitions and the v1 loader block."""
+def clean_bashrc(rc_file: Path, managed_names: set[str],
+                  current_marker: str) -> None:
+    """Remove stale alias/function definitions and old loader blocks."""
     if not rc_file.exists():
         return
     content = rc_file.read_text()
@@ -50,8 +51,9 @@ def clean_bashrc(rc_file: Path, managed_names: set[str]) -> None:
                     break
             continue
 
-        # Remove v1 loader block (# bash_config loader, without v2)
-        if re.match(r"^#\s*bash_config\s+loader\s*$", stripped):
+        # Remove old loader blocks (any version except current)
+        if (re.match(r"^#\s*bash_config\s+loader", stripped)
+                and current_marker not in line):
             fi_count = 0
             while i < len(lines):
                 if lines[i].strip() == "fi":
@@ -105,10 +107,10 @@ def main() -> None:
     link_dir(repo_dir / "functions", functions_dir)
 
     rc_file = Path.home() / ".bashrc"
+    bashrc_marker = "# bash_config loader v3"
     managed_names = collect_managed_names(repo_dir)
-    clean_bashrc(rc_file, managed_names)
+    clean_bashrc(rc_file, managed_names, bashrc_marker)
 
-    bashrc_marker = "# bash_config loader v2"
     bashrc_snippet = f"""
 {bashrc_marker}
 if [ -d "$HOME/.bash_aliases" ]; then
@@ -121,6 +123,8 @@ fi
 if [ -d "$HOME/.bash_functions" ]; then
     for file in "$HOME/.bash_functions"/*.sh; do
         [ -e "$file" ] || continue
+        # Clear any stale alias so the function definition parses cleanly.
+        unalias "$(basename "${{file%.sh}}")" 2>/dev/null
         . "$file"
     done
     # Export functions so bash subshells (watch, xargs, bash -c) see them.
