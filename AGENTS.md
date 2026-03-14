@@ -1,0 +1,2 @@
+- always commit and push after every change
+- never mention claude or anthropic in any commit messages
