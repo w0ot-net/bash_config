@@ -1,7 +1,75 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+
+def collect_managed_names(repo_dir: Path) -> set[str]:
+    """Return stem names from aliases/*.sh and functions/*.sh."""
+    names: set[str] = set()
+    for sub in ("aliases", "functions"):
+        d = repo_dir / sub
+        if d.is_dir():
+            for f in d.glob("*.sh"):
+                names.add(f.stem)
+    return names
+
+
+def clean_bashrc(rc_file: Path, managed_names: set[str]) -> None:
+    """Remove stale alias/function definitions and the v1 loader block."""
+    if not rc_file.exists():
+        return
+    content = rc_file.read_text()
+    lines = content.splitlines(keepends=True)
+
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Remove alias lines for managed names
+        m = re.match(r"^\s*alias\s+([\w][\w-]*)=", line)
+        if m and m.group(1) in managed_names:
+            i += 1
+            continue
+
+        # Remove inline function blocks for managed names (brace-depth)
+        m = re.match(r"^([\w][\w-]*)\s*\(\)\s*\{", line)
+        if m and m.group(1) in managed_names:
+            depth = 0
+            while i < len(lines):
+                for ch in lines[i]:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                i += 1
+                if depth <= 0:
+                    break
+            continue
+
+        # Remove v1 loader block (# bash_config loader, without v2)
+        if re.match(r"^#\s*bash_config\s+loader\s*$", stripped):
+            fi_count = 0
+            while i < len(lines):
+                if lines[i].strip() == "fi":
+                    fi_count += 1
+                i += 1
+                if fi_count >= 2:
+                    break
+            continue
+
+        result.append(line)
+        i += 1
+
+    new_content = "".join(result)
+    # Collapse runs of 3+ blank lines to 2
+    new_content = re.sub(r"\n{4,}", "\n\n\n", new_content)
+
+    if new_content != content:
+        rc_file.write_text(new_content)
 
 
 def link_dir(src_dir: Path, dst_dir: Path) -> None:
@@ -36,6 +104,10 @@ def main() -> None:
     link_dir(repo_dir / "aliases", aliases_dir)
     link_dir(repo_dir / "functions", functions_dir)
 
+    rc_file = Path.home() / ".bashrc"
+    managed_names = collect_managed_names(repo_dir)
+    clean_bashrc(rc_file, managed_names)
+
     bashrc_marker = "# bash_config loader v2"
     bashrc_snippet = f"""
 {bashrc_marker}
@@ -58,7 +130,7 @@ if [ -d "$HOME/.bash_functions" ]; then
     done
 fi
 """
-    ensure_snippet(Path.home() / ".bashrc", bashrc_marker, bashrc_snippet)
+    ensure_snippet(rc_file, bashrc_marker, bashrc_snippet)
 
     bash_profile = Path.home() / ".bash_profile"
     profile_marker = "# bash_config: source bashrc"
