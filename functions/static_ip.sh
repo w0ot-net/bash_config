@@ -1,8 +1,23 @@
-: "${TMPDIR:=/tmp}"
-_STATIC_IP_DIR="${TMPDIR%/}/static-ip-state"
-_STATIC_IP_HOOKS_DIR="/etc/dhcp/dhclient-enter-hooks.d"
+_STATIC_IP_STATE="/tmp/static-ip-state"
+_STATIC_IP_HOOK="/etc/dhcp/dhclient-enter-hooks"
+_STATIC_IP_MARKER="# --- set_static_ip guard ---"
 
-mkdir -p "$_STATIC_IP_DIR"
+mkdir -p "$_STATIC_IP_STATE"
+
+# Install a guard into the dhclient-enter-hooks file (sourced by dhclient-script).
+# When dhclient runs on a blocked interface, `exit 0` terminates the sourcing
+# dhclient-script process, preventing any address/route changes.
+_static_ip_install_hook() {
+    [ -f "$_STATIC_IP_HOOK" ] && grep -qF "$_STATIC_IP_MARKER" "$_STATIC_IP_HOOK" && return 0
+    cat >> "$_STATIC_IP_HOOK" <<'HOOK'
+
+# --- set_static_ip guard ---
+if [ -f "/tmp/static-ip-state/${interface}.static" ]; then
+    exit 0
+fi
+# --- end set_static_ip guard ---
+HOOK
+}
 
 set_static_ip() {
     local iface="$1" addr="$2" gw="$3"
@@ -25,7 +40,7 @@ set_static_ip() {
     fi
 
     # Release DHCP lease and stop dhclient
-    dhclient -r "$iface" 2>/dev/null
+    command dhclient -r "$iface" 2>/dev/null
 
     # Set static address
     ip addr flush dev "$iface"
@@ -36,15 +51,9 @@ set_static_ip() {
     [ -n "$gw" ] && ip route replace default via "$gw" dev "$iface"
 
     # Block future dhclient runs on this interface
-    mkdir -p "$_STATIC_IP_HOOKS_DIR" 2>/dev/null
-    cat > "$_STATIC_IP_HOOKS_DIR/static-$iface" <<HOOK
-# Installed by set_static_ip — block dhclient on $iface
-if [ "\$interface" = "$iface" ]; then
-    exit_status=1
-fi
-HOOK
+    _static_ip_install_hook
+    printf '%s\n' "$addr" > "$_STATIC_IP_STATE/$iface.static"
 
-    printf '%s\n' "$addr" > "$_STATIC_IP_DIR/$iface.static"
     printf 'set static %s on %s; dhclient blocked\n' "$addr" "$iface"
 }
 
@@ -55,13 +64,12 @@ set_dynamic_ip() {
     command -v ip >/dev/null 2>&1 || { printf 'set_dynamic_ip: ip not found\n' >&2; return 1; }
     ip link show dev "$iface" >/dev/null 2>&1 || { printf 'set_dynamic_ip: interface not found: %s\n' "$iface" >&2; return 1; }
 
-    # Remove dhclient block
-    rm -f "$_STATIC_IP_HOOKS_DIR/static-$iface"
-    rm -f "$_STATIC_IP_DIR/$iface.static"
+    # Remove state (unblocks dhclient via the hook's file check)
+    rm -f "$_STATIC_IP_STATE/$iface.static"
 
     # Flush and acquire via DHCP
     ip addr flush dev "$iface"
-    dhclient "$iface"
+    command dhclient "$iface"
 
     printf 'restored DHCP on %s\n' "$iface"
 }
