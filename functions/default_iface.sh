@@ -227,102 +227,10 @@ default_iface_prefer() {
     printf 'preferred %s; blocked all other default routes\n' "$preferred"
 }
 
-default_iface_watch() {
-    local iface="$1"
-    local interval="${2:-5}"
-    local pidfile="$_DEFAULT_IFACE_DIR/watch.pid"
-    local logfile="$_DEFAULT_IFACE_DIR/watch.log"
-    local fail_threshold=3
-    local recover_threshold=3
-
-    [ -n "$iface" ] || { printf 'usage: default_iface_watch INTERFACE [INTERVAL]\n' >&2; return 2; }
-    command -v ip >/dev/null 2>&1 || { printf 'default_iface_watch: ip not found\n' >&2; return 1; }
-    ip link show dev "$iface" >/dev/null 2>&1 || { printf 'default_iface_watch: interface not found: %s\n' "$iface" >&2; return 1; }
-
-    # Kill existing watch
-    if [ -f "$pidfile" ]; then
-        kill "$(cat "$pidfile")" 2>/dev/null
-        rm -f "$pidfile"
-    fi
-
-    # Initial prefer
-    default_iface_prefer "$iface" || return 1
-
-    local gw
-    gw=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3; exit}')
-    [ -n "$gw" ] || { printf 'default_iface_watch: no gateway found for %s\n' "$iface" >&2; return 1; }
-
-    : > "$logfile"
-
-    (
-        local fails=0 successes=0 down=false ts
-
-        trap 'rm -f "'"$pidfile"'"; exit 0' TERM INT
-
-        while true; do
-            ts=$(date '+%H:%M:%S')
-            if ping -c 1 -W 2 -I "$iface" "$gw" >/dev/null 2>&1; then
-                fails=0
-                successes=$((successes + 1))
-                if $down && [ "$successes" -ge "$recover_threshold" ]; then
-                    printf '[%s] %s recovered, re-preferring\n' "$ts" "$iface" | tee -a "$logfile"
-                    default_iface_prefer "$iface" >/dev/null 2>&1
-                    down=false
-                fi
-            else
-                successes=0
-                fails=$((fails + 1))
-                if ! $down && [ "$fails" -ge "$fail_threshold" ]; then
-                    printf '[%s] %s down (%d failures), falling back\n' "$ts" "$iface" "$fails" | tee -a "$logfile"
-                    rm -f "$_DEFAULT_IFACE_DIR"/*.blocked
-                    _default_iface_rebuild 2>/dev/null
-                    down=true
-                fi
-            fi
-            sleep "$interval"
-        done
-    ) &
-
-    local watchpid=$!
-    disown "$watchpid" 2>/dev/null
-    printf '%s' "$watchpid" > "$pidfile"
-    printf 'watching %s (pid %s, gateway %s, every %ss)\n' "$iface" "$watchpid" "$gw" "$interval"
-    printf 'log: %s\n' "$logfile"
-}
-
-default_iface_unwatch() {
-    local pidfile="$_DEFAULT_IFACE_DIR/watch.pid"
-
-    if [ ! -f "$pidfile" ]; then
-        printf 'default_iface_unwatch: no active watch\n' >&2
-        return 1
-    fi
-
-    local pid
-    pid=$(cat "$pidfile")
-    kill "$pid" 2>/dev/null
-    rm -f "$pidfile"
-
-    # Restore everything
-    rm -f "$_DEFAULT_IFACE_DIR"/*.blocked
-    _default_iface_rebuild 2>/dev/null
-
-    printf 'stopped watching (pid %s), routing restored\n' "$pid"
-}
-
 default_iface_status() {
     local f iface
 
     command -v ip >/dev/null 2>&1 || { printf 'default_iface_status: ip not found\n' >&2; return 1; }
-
-    # Watch state
-    local pidfile="$_DEFAULT_IFACE_DIR/watch.pid"
-    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-        printf 'watch: active (pid %s)\n' "$(cat "$pidfile")"
-    else
-        printf 'watch: inactive\n'
-        [ -f "$pidfile" ] && rm -f "$pidfile"
-    fi
 
     printf 'blocked interfaces:'
     local any=false
