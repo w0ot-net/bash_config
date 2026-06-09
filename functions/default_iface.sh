@@ -84,6 +84,7 @@ _default_iface_rebuild() {
         ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
         ip rule del priority 32766 2>/dev/null
         ip rule add priority 32766 lookup main
+        rm -f "$_DEFAULT_IFACE_DIR/preferred"
         # Restore original DNS
         if [ -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
             cp "$_DEFAULT_IFACE_DIR/resolv.conf.bak" /etc/resolv.conf
@@ -114,6 +115,7 @@ _default_iface_rebuild() {
         ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
         ip rule del priority 32766 2>/dev/null
         ip rule add priority 32766 lookup main
+        rm -f "$_DEFAULT_IFACE_DIR/preferred"
         # Restore original DNS
         if [ -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
             cp "$_DEFAULT_IFACE_DIR/resolv.conf.bak" /etc/resolv.conf
@@ -234,6 +236,9 @@ default_iface_prefer() {
     if ! _default_iface_rebuild; then
         return 1
     fi
+
+    # Record preferred interface so NM dispatcher can re-apply after carrier flaps
+    printf '%s' "$preferred" > "$_DEFAULT_IFACE_DIR/preferred"
 
     # Switch DNS to the preferred interface's DHCP nameserver
     local dns
