@@ -172,6 +172,28 @@ default_iface_prefer() {
     command -v ip >/dev/null 2>&1 || { printf 'default_iface_prefer: ip not found\n' >&2; return 1; }
     ip link show dev "$preferred" >/dev/null 2>&1 || { printf 'default_iface_prefer: interface not found: %s\n' "$preferred" >&2; return 1; }
 
+    # Verify NetworkManager state if nmcli is available
+    if command -v nmcli >/dev/null 2>&1; then
+        local nm_state
+        nm_state=$(nmcli -t -f GENERAL.STATE device show "$preferred" 2>/dev/null | cut -d: -f2)
+        case $nm_state in
+            *unmanaged*|*unavailable*|*disconnected*)
+                printf 'default_iface_prefer: WARNING: %s is not managed by NetworkManager\n' "$preferred" >&2
+                printf 'default_iface_prefer: carrier flaps will not auto-recover; run:\n' >&2
+                printf '  nmcli connection add type ethernet con-name %s ifname %s ipv4.method auto ipv4.never-default yes connection.autoconnect yes\n' "$preferred" "$preferred" >&2
+                printf '  nmcli connection up %s\n' "$preferred" >&2
+                ;;
+            *activated*|*connected*)
+                local never_default
+                never_default=$(nmcli -t -f ipv4.never-default connection show "$preferred" 2>/dev/null | cut -d: -f2)
+                if [ "$never_default" != "yes" ]; then
+                    printf 'default_iface_prefer: WARNING: NetworkManager will conflict with routing policy for %s\n' "$preferred" >&2
+                    printf 'default_iface_prefer: run: nmcli connection modify %s ipv4.never-default yes && nmcli connection up %s\n' "$preferred" "$preferred" >&2
+                fi
+                ;;
+        esac
+    fi
+
     # Ensure the preferred interface has a default route; auto-add from DHCP if missing
     if ! _default_iface_has_default_route "$preferred"; then
         gw=$(_default_iface_discover_gw "$preferred")
