@@ -1,298 +1,273 @@
-: "${TMPDIR:=/tmp}"
-_DEFAULT_IFACE_DIR="${TMPDIR%/}/default-iface-state"
-_DEFAULT_IFACE_TABLE=42
-_DEFAULT_IFACE_PRIO=100
-_DEFAULT_IFACE_REPLY_PRIO=50
+# default_iface — make a single interface the system's default egress,
+# fail-closed, using NetworkManager as the source of truth.
+#
+# Preference is expressed entirely through NM connection properties:
+#   preferred iface : ipv4.never-default no  + low ipv4.route-metric
+#                     + exclusive DNS (negative ipv4.dns-priority)
+#   every other     : ipv4.never-default yes + ipv4.ignore-auto-dns yes
+#
+# Because the policy lives in the connection profiles, NM re-applies it
+# automatically on carrier-up, DHCP renewal, gateway change, and reboot —
+# no custom routing table, no ip rules, no dispatcher hook, no /tmp state.
+# When the preferred iface is down there is simply no default route, so
+# traffic fails closed instead of leaking onto another network.
 
-mkdir -p "$_DEFAULT_IFACE_DIR"
+_DEFAULT_IFACE_STATE_DIR="/var/lib/default-iface"
+_DEFAULT_IFACE_PREF_METRIC=50
+_DEFAULT_IFACE_DNS_PRIO=-50
 
-_default_iface_lease_files() {
-    local iface="$1"
-    local nm_dir="/var/lib/NetworkManager"
-    local f
-
-    printf '%s\n' /var/lib/dhcp/dhclient.leases
-    printf '%s\n' "/var/lib/dhcp/dhclient.${iface}.leases"
-    printf '%s\n' "/var/lib/dhcp/dhclient-${iface}.leases"
-
-    if [ -d "$nm_dir" ]; then
-        for f in "$nm_dir"/*-"${iface}".lease "$nm_dir"/internal-*-"${iface}".lease; do
-            [ -f "$f" ] && printf '%s\n' "$f"
-        done
-    fi
+_default_iface_have_nmcli() {
+    command -v nmcli >/dev/null 2>&1 || {
+        printf 'default_iface: nmcli not found (NetworkManager required)\n' >&2
+        return 1
+    }
 }
 
-_default_iface_discover_gw() {
-    local iface="$1" gw="" f
-    while IFS= read -r f; do
-        [ -f "$f" ] || continue
-        gw=$(awk -v iface="$iface" '
-            /^lease \{/              { in_lease=1; cur_iface=""; cur_gw="" }
-            in_lease && /interface/  { gsub(/[";]/, ""); cur_iface=$2 }
-            in_lease && /option routers/ { gsub(/[;]/, ""); cur_gw=$3 }
-            in_lease && /\}/         {
-                if ((cur_iface == "" || cur_iface == iface) && cur_gw != "")
-                    gw = cur_gw
-                in_lease=0
-            }
-            END { print gw }
-        ' "$f")
-        [ -n "$gw" ] && { printf '%s' "$gw"; return 0; }
-    done < <(_default_iface_lease_files "$iface")
+# Resolve an interface name to the UUID of the connection that governs it:
+# the active connection if there is one, otherwise a saved profile bound to it.
+_default_iface_con_for_iface() {
+    local iface="$1" name uuid ifn
+    name=$(nmcli -t -g GENERAL.CONNECTION device show "$iface" 2>/dev/null)
+    if [ -n "$name" ] && [ "$name" != "--" ]; then
+        uuid=$(nmcli -g connection.uuid connection show "$name" 2>/dev/null)
+        [ -n "$uuid" ] && { printf '%s' "$uuid"; return 0; }
+    fi
+    while IFS= read -r uuid; do
+        [ -n "$uuid" ] || continue
+        ifn=$(nmcli -g connection.interface-name connection show "$uuid" 2>/dev/null)
+        [ "$ifn" = "$iface" ] && { printf '%s' "$uuid"; return 0; }
+    done < <(nmcli -t -g UUID connection show 2>/dev/null)
     return 1
 }
 
-_default_iface_discover_dns() {
-    local iface="$1" dns="" f
-    while IFS= read -r f; do
-        [ -f "$f" ] || continue
-        dns=$(awk -v iface="$iface" '
-            /^lease \{/              { in_lease=1; cur_iface=""; cur_dns="" }
-            in_lease && /interface/  { gsub(/[";]/, ""); cur_iface=$2 }
-            in_lease && /domain-name-servers/ { gsub(/[;]/, ""); cur_dns=$3 }
-            in_lease && /\}/         {
-                if ((cur_iface == "" || cur_iface == iface) && cur_dns != "")
-                    dns = cur_dns
-                in_lease=0
-            }
-            END { print dns }
-        ' "$f")
-        [ -n "$dns" ] && { printf '%s' "$dns"; return 0; }
-    done < <(_default_iface_lease_files "$iface")
-    return 1
+# UUIDs of all active connections that can carry a default route.
+_default_iface_default_capable_cons() {
+    local name uuid type dev
+    while IFS=: read -r name uuid type dev; do
+        case "$type" in
+            802-3-ethernet|802-11-wireless) printf '%s\n' "$uuid" ;;
+        esac
+    done < <(nmcli -t -f NAME,UUID,TYPE,DEVICE connection show --active 2>/dev/null)
 }
 
-_default_iface_has_default_route() {
-    ip route show default dev "$1" 2>/dev/null | grep -q .
+_default_iface_dev_of() {
+    nmcli -g GENERAL.DEVICES connection show "$1" 2>/dev/null | head -1
 }
 
-_default_iface_rebuild() {
-    local blocked line skip iface f
+# Re-apply a connection's settings to its device with minimal disruption.
+_default_iface_apply() {
+    local uuid="$1" dev
+    dev=$(_default_iface_dev_of "$uuid")
+    if [ -n "$dev" ] && nmcli device reapply "$dev" >/dev/null 2>&1; then
+        return 0
+    fi
+    nmcli connection up "$uuid" >/dev/null 2>&1
+}
 
-    blocked=$(
-        for f in "$_DEFAULT_IFACE_DIR"/*.blocked; do
-            [ -f "$f" ] || continue
-            f=${f##*/}
-            printf '%s\n' "${f%.blocked}"
-        done
-    )
+# Snapshot a connection's original ipv4 routing/DNS props once, so restore
+# can put them back exactly. Never overwrites an existing snapshot.
+_default_iface_save_orig() {
+    local uuid="$1" f="$_DEFAULT_IFACE_STATE_DIR/$uuid.orig"
+    [ -f "$f" ] && return 0
+    mkdir -p "$_DEFAULT_IFACE_STATE_DIR"
+    {
+        printf 'route-metric=%s\n'    "$(nmcli -g ipv4.route-metric    connection show "$uuid" 2>/dev/null)"
+        printf 'never-default=%s\n'   "$(nmcli -g ipv4.never-default   connection show "$uuid" 2>/dev/null)"
+        printf 'dns-priority=%s\n'    "$(nmcli -g ipv4.dns-priority    connection show "$uuid" 2>/dev/null)"
+        printf 'ignore-auto-dns=%s\n' "$(nmcli -g ipv4.ignore-auto-dns connection show "$uuid" 2>/dev/null)"
+    } > "$f"
+}
 
-    ip route flush table "$_DEFAULT_IFACE_TABLE" 2>/dev/null
-    while ip rule del priority "$_DEFAULT_IFACE_REPLY_PRIO" 2>/dev/null; do :; done
+_default_iface_restore_con() {
+    local uuid="$1" f="$_DEFAULT_IFACE_STATE_DIR/$uuid.orig"
+    local k v rm nd dp iad
+    [ -f "$f" ] || { printf 'default_iface: no saved state for %s\n' "$uuid" >&2; return 1; }
+    while IFS='=' read -r k v; do
+        case "$k" in
+            route-metric)    rm="$v" ;;
+            never-default)   nd="$v" ;;
+            dns-priority)    dp="$v" ;;
+            ignore-auto-dns) iad="$v" ;;
+        esac
+    done < "$f"
+    nmcli connection modify "$uuid" \
+        ipv4.route-metric    "${rm:--1}" \
+        ipv4.never-default   "${nd:-no}" \
+        ipv4.dns-priority    "${dp:-0}" \
+        ipv4.ignore-auto-dns "${iad:-no}" 2>/dev/null
+    _default_iface_apply "$uuid"
+    rm -f "$f"
+}
 
-    if [ -z "$blocked" ]; then
-        ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
-        ip rule del priority 32766 2>/dev/null
-        ip rule add priority 32766 lookup main
-        rm -f "$_DEFAULT_IFACE_DIR/preferred"
-        # Restore original DNS
-        if [ -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
-            cp "$_DEFAULT_IFACE_DIR/resolv.conf.bak" /etc/resolv.conf
-            rm -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak"
+# Tear down the previous policy-routing implementation (custom table 42,
+# ip rules, /tmp state, dispatcher hook) if it is still present. Idempotent.
+_default_iface_teardown_legacy() {
+    local removed=0 r old="/tmp/default-iface-state"
+
+    if ip rule show 2>/dev/null | grep -q "lookup 42"; then
+        ip route flush table 42 2>/dev/null
+        while ip rule del priority 100 2>/dev/null; do :; done
+        while ip rule del priority 50  2>/dev/null; do :; done
+        if ip rule show 2>/dev/null | grep -q "32766:.*suppress_prefixlength"; then
+            ip rule del priority 32766 2>/dev/null
+            ip rule add priority 32766 lookup main 2>/dev/null
         fi
-        return
+        removed=1
     fi
 
-    # Safety net: verify at least one default route will survive
-    local have_route=false
-    ip route show default | while IFS= read -r line; do
-        skip=false
-        for iface in $blocked; do
-            case $line in
-                *" dev $iface "*|*" dev $iface") skip=true; break ;;
-            esac
-        done
-        $skip || { have_route=true; ip route add $line table "$_DEFAULT_IFACE_TABLE"; }
-    done
+    # Drop any default route the old prefer added by hand (it used metric 10).
+    while IFS= read -r r; do
+        [ -n "$r" ] && ip route del $r 2>/dev/null
+    done < <(ip route show default 2>/dev/null | grep 'metric 10')
 
-    # Subshell pipe means have_route doesn't propagate; check the table directly
-    if ! ip route show table "$_DEFAULT_IFACE_TABLE" 2>/dev/null | grep -q .; then
-        printf 'default_iface: aborting — no default routes would remain\n' >&2
-        printf 'default_iface: rolling back block state\n' >&2
-        for f in "$_DEFAULT_IFACE_DIR"/*.blocked; do
-            [ -f "$f" ] && rm -f "$f"
-        done
-        ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
-        ip rule del priority 32766 2>/dev/null
-        ip rule add priority 32766 lookup main
-        rm -f "$_DEFAULT_IFACE_DIR/preferred"
-        # Restore original DNS
-        if [ -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
-            cp "$_DEFAULT_IFACE_DIR/resolv.conf.bak" /etc/resolv.conf
-            rm -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak"
-        fi
+    if [ -d "$old" ]; then
+        [ -f "$old/resolv.conf.bak" ] && cp "$old/resolv.conf.bak" /etc/resolv.conf 2>/dev/null
+        rm -rf "$old"
+        removed=1
+    fi
+
+    if [ -f /etc/NetworkManager/dispatcher.d/90-default-iface ]; then
+        rm -f /etc/NetworkManager/dispatcher.d/90-default-iface
+        rm -f /tmp/default-iface-dispatcher.log
+        removed=1
+    fi
+
+    [ "$removed" = 1 ] && \
+        printf 'default_iface: migrated off legacy policy-routing/dispatcher setup\n' >&2
+    return 0
+}
+
+default_iface_prefer() {
+    local preferred="$1" pref_uuid uuid subnet net
+
+    [ -n "$preferred" ] || { printf 'usage: default_iface_prefer INTERFACE\n' >&2; return 2; }
+    _default_iface_have_nmcli || return 1
+    ip link show dev "$preferred" >/dev/null 2>&1 || {
+        printf 'default_iface_prefer: interface not found: %s\n' "$preferred" >&2; return 1; }
+
+    pref_uuid=$(_default_iface_con_for_iface "$preferred")
+    if [ -z "$pref_uuid" ]; then
+        printf 'default_iface_prefer: no NetworkManager connection for %s\n' "$preferred" >&2
+        printf 'default_iface_prefer: create one with:\n' >&2
+        printf '  nmcli connection add type ethernet con-name %s ifname %s ipv4.method auto connection.autoconnect yes\n' \
+            "$preferred" "$preferred" >&2
         return 1
     fi
 
-    ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
-    ip rule add priority "$_DEFAULT_IFACE_PRIO" lookup "$_DEFAULT_IFACE_TABLE"
+    _default_iface_teardown_legacy
+    mkdir -p "$_DEFAULT_IFACE_STATE_DIR"
 
-    ip rule del priority 32766 2>/dev/null
-    ip rule add priority 32766 lookup main suppress_prefixlength 0
+    # Preferred connection: owns the default route, exclusive DNS.
+    _default_iface_save_orig "$pref_uuid"
+    nmcli connection modify "$pref_uuid" \
+        ipv4.never-default no \
+        ipv4.route-metric "$_DEFAULT_IFACE_PREF_METRIC" \
+        ipv4.ignore-auto-dns no \
+        ipv4.dns-priority "$_DEFAULT_IFACE_DNS_PRIO" \
+        connection.autoconnect yes 2>/dev/null || {
+            printf 'default_iface_prefer: failed to configure %s\n' "$preferred" >&2; return 1; }
+    printf '%s' "$pref_uuid" > "$_DEFAULT_IFACE_STATE_DIR/preferred"
 
-    # Source-based rules: reply traffic from blocked interface IPs still routes normally
-    local addr
-    for iface in $blocked; do
-        for addr in $(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}'); do
-            ip rule add from "${addr%/*}" lookup main priority "$_DEFAULT_IFACE_REPLY_PRIO"
-        done
-    done
+    # Every other default-capable connection: fail closed.
+    while IFS= read -r uuid; do
+        [ -n "$uuid" ] || continue
+        [ "$uuid" = "$pref_uuid" ] && continue
+        _default_iface_save_orig "$uuid"
+        nmcli connection modify "$uuid" \
+            ipv4.never-default yes \
+            ipv4.ignore-auto-dns yes 2>/dev/null
+    done < <(_default_iface_default_capable_cons)
+
+    # Apply others first, then the preferred so its route/DNS settle last.
+    while IFS= read -r uuid; do
+        [ -n "$uuid" ] || continue
+        [ "$uuid" = "$pref_uuid" ] && continue
+        _default_iface_apply "$uuid"
+    done < <(_default_iface_default_capable_cons)
+    _default_iface_apply "$pref_uuid"
+
+    printf 'preferred %s; all other interfaces fail closed (never-default)\n' "$preferred"
 }
 
 default_iface_block() {
-    local iface="$1"
+    local iface="$1" uuid
 
     [ -n "$iface" ] || { printf 'usage: default_iface_block INTERFACE\n' >&2; return 2; }
-    command -v ip >/dev/null 2>&1 || { printf 'default_iface_block: ip not found\n' >&2; return 1; }
-    ip link show dev "$iface" >/dev/null 2>&1 || { printf 'default_iface_block: interface not found: %s\n' "$iface" >&2; return 1; }
+    _default_iface_have_nmcli || return 1
+    ip link show dev "$iface" >/dev/null 2>&1 || {
+        printf 'default_iface_block: interface not found: %s\n' "$iface" >&2; return 1; }
 
-    : > "$_DEFAULT_IFACE_DIR/$iface.blocked"
-    if ! _default_iface_rebuild; then
-        printf 'default_iface_block: refused — blocking %s would leave no default routes\n' "$iface" >&2
-        return 1
-    fi
+    uuid=$(_default_iface_con_for_iface "$iface")
+    [ -n "$uuid" ] || { printf 'default_iface_block: no NetworkManager connection for %s\n' "$iface" >&2; return 1; }
+
+    _default_iface_save_orig "$uuid"
+    nmcli connection modify "$uuid" \
+        ipv4.never-default yes \
+        ipv4.ignore-auto-dns yes 2>/dev/null || {
+            printf 'default_iface_block: failed to modify %s\n' "$iface" >&2; return 1; }
+    _default_iface_apply "$uuid"
     printf 'blocked default routes for %s\n' "$iface"
 }
 
 default_iface_restore() {
-    local iface="$1"
+    local iface="$1" uuid f
 
-    [ -n "$iface" ] || { printf 'usage: default_iface_restore INTERFACE\n' >&2; return 2; }
-    command -v ip >/dev/null 2>&1 || { printf 'default_iface_restore: ip not found\n' >&2; return 1; }
-    [ -f "$_DEFAULT_IFACE_DIR/$iface.blocked" ] || { printf 'default_iface_restore: %s is not blocked\n' "$iface" >&2; return 1; }
+    _default_iface_have_nmcli || return 1
 
-    rm -f "$_DEFAULT_IFACE_DIR/$iface.blocked"
-    _default_iface_rebuild
-    printf 'restored default routes for %s\n' "$iface"
-}
-
-default_iface_prefer() {
-    local preferred="$1"
-    local line other gw
-
-    [ -n "$preferred" ] || { printf 'usage: default_iface_prefer INTERFACE\n' >&2; return 2; }
-    command -v ip >/dev/null 2>&1 || { printf 'default_iface_prefer: ip not found\n' >&2; return 1; }
-    ip link show dev "$preferred" >/dev/null 2>&1 || { printf 'default_iface_prefer: interface not found: %s\n' "$preferred" >&2; return 1; }
-
-    # Check for competing dhclient processes that would wipe our routes
-    local stale_pids
-    stale_pids=$(pgrep -f "dhclient.*$preferred" 2>/dev/null)
-    if [ -n "$stale_pids" ]; then
-        printf 'default_iface_prefer: WARNING: rogue dhclient running for %s (PIDs: %s)\n' "$preferred" "$(echo $stale_pids)" >&2
-        printf 'default_iface_prefer: killing to prevent route conflicts\n' >&2
-        kill $stale_pids 2>/dev/null
+    if [ -n "$iface" ]; then
+        uuid=$(_default_iface_con_for_iface "$iface")
+        [ -n "$uuid" ] || { printf 'default_iface_restore: no NetworkManager connection for %s\n' "$iface" >&2; return 1; }
+        _default_iface_restore_con "$uuid" || return 1
+        printf 'restored default routes for %s\n' "$iface"
+        return 0
     fi
 
-    # Verify NetworkManager state if nmcli is available
-    if command -v nmcli >/dev/null 2>&1; then
-        local nm_state
-        nm_state=$(nmcli -t -f GENERAL.STATE device show "$preferred" 2>/dev/null | cut -d: -f2)
-        case $nm_state in
-            *unmanaged*|*unavailable*|*disconnected*)
-                printf 'default_iface_prefer: WARNING: %s is not managed by NetworkManager\n' "$preferred" >&2
-                printf 'default_iface_prefer: carrier flaps will not auto-recover; run:\n' >&2
-                printf '  nmcli connection add type ethernet con-name %s ifname %s ipv4.method auto ipv4.never-default yes connection.autoconnect yes\n' "$preferred" "$preferred" >&2
-                printf '  nmcli connection up %s\n' "$preferred" >&2
-                ;;
-            *activated*|*connected*)
-                local never_default
-                never_default=$(nmcli -t -f ipv4.never-default connection show "$preferred" 2>/dev/null | cut -d: -f2)
-                if [ "$never_default" != "yes" ]; then
-                    printf 'default_iface_prefer: WARNING: NetworkManager will conflict with routing policy for %s\n' "$preferred" >&2
-                    printf 'default_iface_prefer: run: nmcli connection modify %s ipv4.never-default yes && nmcli connection up %s\n' "$preferred" "$preferred" >&2
-                fi
-                ;;
-        esac
-    fi
-
-    # Ensure the preferred interface has a default route; auto-add from DHCP if missing
-    if ! _default_iface_has_default_route "$preferred"; then
-        gw=$(_default_iface_discover_gw "$preferred")
-        if [ -n "$gw" ]; then
-            # Use metric 10 to avoid "File exists" conflict with existing default routes
-            if ip route add default via "$gw" dev "$preferred" metric 10 2>/dev/null; then
-                printf 'default_iface_prefer: added default route via %s dev %s (from DHCP lease)\n' "$gw" "$preferred" >&2
-            elif _default_iface_has_default_route "$preferred"; then
-                printf 'default_iface_prefer: default route via %s dev %s already present\n' "$gw" "$preferred" >&2
-            else
-                printf 'default_iface_prefer: failed to add default route via %s dev %s\n' "$gw" "$preferred" >&2
-                return 1
-            fi
-        else
-            local subnet
-            subnet=$(ip -4 -o addr show dev "$preferred" 2>/dev/null | awk '{print $4}' | head -1)
-            printf 'default_iface_prefer: %s has no default route and no DHCP lease found\n' "$preferred" >&2
-            if [ -n "$subnet" ]; then
-                local net="${subnet%.*}"
-                printf 'default_iface_prefer: try: ip route add default via %s.1 dev %s\n' "$net" "$preferred" >&2
-                printf 'default_iface_prefer:   or: ip route add default via %s.2 dev %s\n' "$net" "$preferred" >&2
-            fi
-            return 1
-        fi
-    fi
-
-    ip route show default | while IFS= read -r line; do
-        case $line in
-            *" dev $preferred "*|*" dev $preferred") ;;
-            *" dev "*)
-                other=${line#* dev }
-                other=${other%% *}
-                : > "$_DEFAULT_IFACE_DIR/$other.blocked"
-                ;;
-        esac
+    # No argument: revert every connection default_iface has touched.
+    local any=false
+    for f in "$_DEFAULT_IFACE_STATE_DIR"/*.orig; do
+        [ -f "$f" ] || continue
+        uuid=${f##*/}; uuid=${uuid%.orig}
+        _default_iface_restore_con "$uuid"
+        any=true
     done
-
-    if ! _default_iface_rebuild; then
-        return 1
-    fi
-
-    # Record preferred interface so NM dispatcher can re-apply after carrier flaps
-    printf '%s' "$preferred" > "$_DEFAULT_IFACE_DIR/preferred"
-
-    # Switch DNS to the preferred interface's DHCP nameserver
-    local dns
-    dns=$(_default_iface_discover_dns "$preferred")
-    if [ -n "$dns" ]; then
-        if [ ! -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
-            cp /etc/resolv.conf "$_DEFAULT_IFACE_DIR/resolv.conf.bak"
-        fi
-        printf 'nameserver %s\n' "$dns" > /etc/resolv.conf
-        printf 'default_iface_prefer: DNS set to %s (from DHCP lease)\n' "$dns" >&2
-    fi
-
-    printf 'preferred %s; blocked all other default routes\n' "$preferred"
+    rm -f "$_DEFAULT_IFACE_STATE_DIR/preferred"
+    $any && printf 'restored all interfaces modified by default_iface\n' \
+         || printf 'default_iface_restore: nothing to restore\n'
 }
 
 default_iface_status() {
-    local f iface
+    local name uuid type dev m nd dp egress
 
-    command -v ip >/dev/null 2>&1 || { printf 'default_iface_status: ip not found\n' >&2; return 1; }
+    _default_iface_have_nmcli || return 1
 
-    printf 'blocked interfaces:'
-    local any=false
-    for f in "$_DEFAULT_IFACE_DIR"/*.blocked; do
-        [ -f "$f" ] || continue
-        f=${f##*/}
-        printf ' %s' "${f%.blocked}"
-        any=true
-    done
-    $any || printf ' (none)'
-    printf '\n'
-
-    printf '\ndefault routes (main table):\n'
-    ip route show default | sed 's/^/  /' || printf '  (none)\n'
-
-    if ip rule show 2>/dev/null | grep -q "lookup $_DEFAULT_IFACE_TABLE"; then
-        printf '\nactive routes (table %s):\n' "$_DEFAULT_IFACE_TABLE"
-        ip route show table "$_DEFAULT_IFACE_TABLE" 2>/dev/null | sed 's/^/  /'
+    printf 'preferred: '
+    if [ -f "$_DEFAULT_IFACE_STATE_DIR/preferred" ]; then
+        local puuid; puuid=$(cat "$_DEFAULT_IFACE_STATE_DIR/preferred")
+        nmcli -g connection.interface-name connection show "$puuid" 2>/dev/null || printf '%s\n' "$puuid"
+    else
+        printf '(none)\n'
     fi
 
-    printf '\negress test: '
-    local egress_dev
-    egress_dev=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
-    if [ -n "$egress_dev" ]; then
-        printf '%s\n' "$egress_dev"
-    else
-        printf 'no route to internet\n'
+    printf '\n%-22s %-7s %-8s %-13s %-9s\n' CONNECTION DEVICE METRIC NEVER-DEFAULT DNS-PRIO
+    while IFS=: read -r name uuid type dev; do
+        case "$type" in 802-3-ethernet|802-11-wireless) ;; *) continue ;; esac
+        m=$(nmcli  -g ipv4.route-metric  connection show "$uuid" 2>/dev/null)
+        nd=$(nmcli -g ipv4.never-default connection show "$uuid" 2>/dev/null)
+        dp=$(nmcli -g ipv4.dns-priority  connection show "$uuid" 2>/dev/null)
+        printf '%-22s %-7s %-8s %-13s %-9s\n' "$name" "${dev:--}" "${m:--}" "${nd:--}" "${dp:--}"
+    done < <(nmcli -t -f NAME,UUID,TYPE,DEVICE connection show --active 2>/dev/null)
+
+    printf '\ndefault routes:\n'
+    ip route show default 2>/dev/null | sed 's/^/  /'
+    [ -n "$(ip route show default 2>/dev/null)" ] || printf '  (none — failing closed)\n'
+
+    printf '\negress -> 8.8.8.8: '
+    egress=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+    [ -n "$egress" ] && printf '%s\n' "$egress" || printf 'no route (failing closed)\n'
+
+    if ip rule show 2>/dev/null | grep -q "lookup 42" \
+       || [ -f /etc/NetworkManager/dispatcher.d/90-default-iface ]; then
+        printf '\nWARNING: legacy policy-routing/dispatcher artifacts present;\n'
+        printf '         run default_iface_prefer to migrate them away.\n'
     fi
 }
