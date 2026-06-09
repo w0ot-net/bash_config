@@ -6,26 +6,26 @@ _DEFAULT_IFACE_REPLY_PRIO=50
 
 mkdir -p "$_DEFAULT_IFACE_DIR"
 
-_default_iface_discover_gw() {
-    local iface="$1" gw=""
-    local lease_files=(
-        /var/lib/dhcp/dhclient.leases
-        "/var/lib/dhcp/dhclient.${iface}.leases"
-        "/var/lib/dhcp/dhclient-${iface}.leases"
-    )
+_default_iface_lease_files() {
+    local iface="$1"
     local nm_dir="/var/lib/NetworkManager"
     local f
 
-    # Check NetworkManager internal lease files
+    printf '%s\n' /var/lib/dhcp/dhclient.leases
+    printf '%s\n' "/var/lib/dhcp/dhclient.${iface}.leases"
+    printf '%s\n' "/var/lib/dhcp/dhclient-${iface}.leases"
+
     if [ -d "$nm_dir" ]; then
         for f in "$nm_dir"/*-"${iface}".lease "$nm_dir"/internal-*-"${iface}".lease; do
-            [ -f "$f" ] && lease_files+=("$f")
+            [ -f "$f" ] && printf '%s\n' "$f"
         done
     fi
+}
 
-    for f in "${lease_files[@]}"; do
+_default_iface_discover_gw() {
+    local iface="$1" gw="" f
+    while IFS= read -r f; do
         [ -f "$f" ] || continue
-        # Parse most recent lease block for this interface
         gw=$(awk -v iface="$iface" '
             /^lease \{/              { in_lease=1; cur_iface=""; cur_gw="" }
             in_lease && /interface/  { gsub(/[";]/, ""); cur_iface=$2 }
@@ -38,8 +38,27 @@ _default_iface_discover_gw() {
             END { print gw }
         ' "$f")
         [ -n "$gw" ] && { printf '%s' "$gw"; return 0; }
-    done
+    done < <(_default_iface_lease_files "$iface")
+    return 1
+}
 
+_default_iface_discover_dns() {
+    local iface="$1" dns="" f
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        dns=$(awk -v iface="$iface" '
+            /^lease \{/              { in_lease=1; cur_iface=""; cur_dns="" }
+            in_lease && /interface/  { gsub(/[";]/, ""); cur_iface=$2 }
+            in_lease && /domain-name-servers/ { gsub(/[;]/, ""); cur_dns=$3 }
+            in_lease && /\}/         {
+                if ((cur_iface == "" || cur_iface == iface) && cur_dns != "")
+                    dns = cur_dns
+                in_lease=0
+            }
+            END { print dns }
+        ' "$f")
+        [ -n "$dns" ] && { printf '%s' "$dns"; return 0; }
+    done < <(_default_iface_lease_files "$iface")
     return 1
 }
 
@@ -65,6 +84,11 @@ _default_iface_rebuild() {
         ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
         ip rule del priority 32766 2>/dev/null
         ip rule add priority 32766 lookup main
+        # Restore original DNS
+        if [ -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
+            cp "$_DEFAULT_IFACE_DIR/resolv.conf.bak" /etc/resolv.conf
+            rm -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak"
+        fi
         return
     fi
 
@@ -90,6 +114,11 @@ _default_iface_rebuild() {
         ip rule del priority "$_DEFAULT_IFACE_PRIO" 2>/dev/null
         ip rule del priority 32766 2>/dev/null
         ip rule add priority 32766 lookup main
+        # Restore original DNS
+        if [ -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
+            cp "$_DEFAULT_IFACE_DIR/resolv.conf.bak" /etc/resolv.conf
+            rm -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak"
+        fi
         return 1
     fi
 
@@ -183,6 +212,18 @@ default_iface_prefer() {
     if ! _default_iface_rebuild; then
         return 1
     fi
+
+    # Switch DNS to the preferred interface's DHCP nameserver
+    local dns
+    dns=$(_default_iface_discover_dns "$preferred")
+    if [ -n "$dns" ]; then
+        if [ ! -f "$_DEFAULT_IFACE_DIR/resolv.conf.bak" ]; then
+            cp /etc/resolv.conf "$_DEFAULT_IFACE_DIR/resolv.conf.bak"
+        fi
+        printf 'nameserver %s\n' "$dns" > /etc/resolv.conf
+        printf 'default_iface_prefer: DNS set to %s (from DHCP lease)\n' "$dns" >&2
+    fi
+
     printf 'preferred %s; blocked all other default routes\n' "$preferred"
 }
 
