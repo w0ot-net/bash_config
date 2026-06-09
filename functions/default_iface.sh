@@ -174,6 +174,15 @@ default_iface_prefer() {
     command -v ip >/dev/null 2>&1 || { printf 'default_iface_prefer: ip not found\n' >&2; return 1; }
     ip link show dev "$preferred" >/dev/null 2>&1 || { printf 'default_iface_prefer: interface not found: %s\n' "$preferred" >&2; return 1; }
 
+    # Check for competing dhclient processes that would wipe our routes
+    local stale_pids
+    stale_pids=$(pgrep -f "dhclient.*$preferred" 2>/dev/null)
+    if [ -n "$stale_pids" ]; then
+        printf 'default_iface_prefer: WARNING: rogue dhclient running for %s (PIDs: %s)\n' "$preferred" "$(echo $stale_pids)" >&2
+        printf 'default_iface_prefer: killing to prevent route conflicts\n' >&2
+        kill $stale_pids 2>/dev/null
+    fi
+
     # Verify NetworkManager state if nmcli is available
     if command -v nmcli >/dev/null 2>&1; then
         local nm_state
