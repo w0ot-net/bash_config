@@ -147,8 +147,15 @@ default_iface_prefer() {
     if ! _default_iface_has_default_route "$preferred"; then
         gw=$(_default_iface_discover_gw "$preferred")
         if [ -n "$gw" ]; then
-            ip route add default via "$gw" dev "$preferred"
-            printf 'default_iface_prefer: added default route via %s dev %s (from DHCP lease)\n' "$gw" "$preferred" >&2
+            # Use metric 10 to avoid "File exists" conflict with existing default routes
+            if ip route add default via "$gw" dev "$preferred" metric 10 2>/dev/null; then
+                printf 'default_iface_prefer: added default route via %s dev %s (from DHCP lease)\n' "$gw" "$preferred" >&2
+            elif _default_iface_has_default_route "$preferred"; then
+                printf 'default_iface_prefer: default route via %s dev %s already present\n' "$gw" "$preferred" >&2
+            else
+                printf 'default_iface_prefer: failed to add default route via %s dev %s\n' "$gw" "$preferred" >&2
+                return 1
+            fi
         else
             local subnet
             subnet=$(ip -4 -o addr show dev "$preferred" 2>/dev/null | awk '{print $4}' | head -1)
