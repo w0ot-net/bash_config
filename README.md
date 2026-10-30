@@ -29,8 +29,8 @@ desktop session is also supported. Non-VirtualBox systems are a successful no-op
 ## NetExec SMB Results
 
 Display the SMB hosts where NetExec recorded a successful authentication, including
-the detected operating system, domain, username, credential type, stored credential,
-and whether the credential had administrative access:
+the detected operating system, domain, username, stored credential, and whether the
+credential had administrative access:
 
 ```sh
 nxc_smb_successes

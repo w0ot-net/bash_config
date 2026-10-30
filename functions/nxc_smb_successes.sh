@@ -51,7 +51,6 @@ SELECT DISTINCT
     h.os,
     u.domain,
     u.username,
-    u.credtype AS credential_type,
     u.password AS credential,
     CASE WHEN ar.id IS NULL THEN 'no' ELSE 'yes' END AS admin
 FROM loggedin_relations AS lr
