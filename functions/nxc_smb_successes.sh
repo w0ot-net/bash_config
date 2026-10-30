@@ -49,9 +49,14 @@ SELECT DISTINCT
     h.ip,
     h.hostname,
     h.os,
+    u.domain,
+    u.username,
+    u.credtype AS credential_type,
+    u.password AS credential,
     CASE WHEN ar.id IS NULL THEN 'no' ELSE 'yes' END AS admin
 FROM loggedin_relations AS lr
 JOIN hosts AS h ON h.id = lr.hostid
+JOIN users AS u ON u.id = lr.userid
 LEFT JOIN admin_relations AS ar
     ON ar.hostid = lr.hostid
    AND ar.userid = lr.userid

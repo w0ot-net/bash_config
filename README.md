@@ -29,7 +29,8 @@ desktop session is also supported. Non-VirtualBox systems are a successful no-op
 ## NetExec SMB Results
 
 Display the SMB hosts where NetExec recorded a successful authentication, including
-the detected operating system and whether the credential had administrative access:
+the detected operating system, domain, username, credential type, stored credential,
+and whether the credential had administrative access:
 
 ```sh
 nxc_smb_successes
@@ -44,4 +45,5 @@ nxc_smb_successes assessment-name
 
 It honors `NXC_PATH` and opens the workspace's `smb.db` read-only. Results include all
 successful SMB authentications stored in that workspace, so use a dedicated NetExec
-workspace when a report must represent one credential test.
+workspace when a report must represent one credential test. The report prints stored
+passwords or hashes directly to the terminal; handle its output as sensitive data.

@@ -37,6 +37,13 @@ class NxcSmbSuccessesTests(unittest.TestCase):
                     userid INTEGER,
                     hostid INTEGER
                 );
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    domain TEXT,
+                    username TEXT,
+                    password TEXT,
+                    credtype TEXT
+                );
                 CREATE TABLE admin_relations (
                     id INTEGER PRIMARY KEY,
                     userid INTEGER,
@@ -48,6 +55,9 @@ class NxcSmbSuccessesTests(unittest.TestCase):
                 INSERT INTO loggedin_relations VALUES
                     (1, 7, 1),
                     (2, 7, 2);
+                INSERT INTO users VALUES
+                    (7, 'WORKGROUP', 'Administrator',
+                     '0123456789abcdef0123456789abcdef', 'hash');
                 INSERT INTO admin_relations VALUES (1, 7, 1);
                 """
             )
@@ -76,6 +86,11 @@ class NxcSmbSuccessesTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("192.0.2.10", completed.stdout)
         self.assertIn("Windows 11 Pro", completed.stdout)
+        self.assertIn("WORKGROUP", completed.stdout)
+        self.assertIn("Administrator", completed.stdout)
+        self.assertIn("credential_type", completed.stdout)
+        self.assertIn("hash", completed.stdout)
+        self.assertIn("0123456789abcdef0123456789abcdef", completed.stdout)
         self.assertIn("yes", completed.stdout)
         self.assertIn("192.0.2.20", completed.stdout)
         self.assertIn("Windows 10 Enterprise", completed.stdout)
