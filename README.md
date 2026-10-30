@@ -25,3 +25,23 @@ combined `--wayland` client, stops only the current user's `VBoxClient` processe
 removes stale `.vboxclient-*.pid` files before restarting the remaining modes. Run it
 as the desktop user; it invokes `sudo` only for the system service restart. A root X11
 desktop session is also supported. Non-VirtualBox systems are a successful no-op.
+
+## NetExec SMB Results
+
+Display the SMB hosts where NetExec recorded a successful authentication, including
+the detected operating system and whether the credential had administrative access:
+
+```sh
+nxc_smb_successes
+```
+
+The function reads the active workspace from `~/.nxc/nxc.conf`. Pass a workspace name
+to inspect it directly:
+
+```sh
+nxc_smb_successes assessment-name
+```
+
+It honors `NXC_PATH` and opens the workspace's `smb.db` read-only. Results include all
+successful SMB authentications stored in that workspace, so use a dedicated NetExec
+workspace when a report must represent one credential test.
